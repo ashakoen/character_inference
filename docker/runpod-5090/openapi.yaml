@@ -1,0 +1,256 @@
+openapi: 3.1.0
+info:
+  title: FLUX.1-dev Inference API
+  description: |
+    Image generation API powered by FLUX.1-dev running on RunPod with RTX 5090.
+    Uses FP8 quantized flow transformer with bf16 text encoder and VAE.
+    Supports LoRA loading/unloading for style and character adapters.
+  version: 1.0.0
+
+servers:
+  - url: https://{pod_id}-8088.proxy.runpod.net
+    description: RunPod proxy endpoint
+    variables:
+      pod_id:
+        description: RunPod pod identifier
+        default: REPLACE_ME
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Bearer token set via AUTH_TOKEN environment variable on the pod
+
+  schemas:
+    GenerateRequest:
+      type: object
+      required:
+        - prompt
+      properties:
+        prompt:
+          type: string
+          description: Text description of the image to generate. Processed by T5 (up to 512 tokens) and CLIP (up to 77 tokens).
+          example: "A fluffy orange cat sitting on a windowsill at sunset"
+        width:
+          type: integer
+          default: 720
+          description: Image width in pixels. Keep total pixels at or below 1024x1024 equivalent to avoid OOM.
+          example: 1024
+        height:
+          type: integer
+          default: 1024
+          description: Image height in pixels. Keep total pixels at or below 1024x1024 equivalent to avoid OOM.
+          example: 1024
+        num_steps:
+          type: integer
+          default: 24
+          description: Number of diffusion steps. More steps = better quality but slower. Range 8-50 typical.
+          example: 28
+        guidance:
+          type: number
+          format: float
+          default: 3.5
+          description: Guidance scale. Higher values follow the prompt more closely. Range 1.0-10.0 typical.
+          example: 3.5
+        seed:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          description: Random seed for reproducible generation. If omitted, a random seed is used.
+          example: 42
+        strength:
+          type: number
+          format: float
+          default: 1.0
+          minimum: 0.0
+          maximum: 1.0
+          description: Diffusion strength when using init_image. 1.0 = full generation, lower values preserve more of the init image.
+        init_image:
+          type: string
+          description: Base64-encoded image or file path on the pod to use as the starting image for img2img generation.
+
+    LoraRequest:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Absolute path to the LoRA safetensors file on the pod.
+          example: "/workspace/lora_styles/my-style.safetensors"
+        scale:
+          type: number
+          format: float
+          default: 1.0
+          description: Scaling factor for LoRA weights. 0.5-1.0 typical for style LoRAs.
+          example: 0.7
+        name:
+          type: string
+          description: Identifier for the LoRA. Used for unloading. If omitted, derived from filename.
+          example: "mystyle"
+        action:
+          type: string
+          enum:
+            - load
+            - unload
+          default: load
+          description: Whether to load or unload the LoRA.
+
+    LoraResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+            - success
+            - error
+        message:
+          type: string
+          description: Error message if status is "error".
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Unauthorized"
+
+paths:
+  /generate:
+    post:
+      summary: Generate an image
+      description: |
+        Generates an image from a text prompt using FLUX.1-dev.
+        Returns the image as streaming JPEG bytes.
+
+        **Recommended resolutions:**
+        - Square: 1024x1024
+        - Landscape 16:9: 1280x720
+        - Portrait 9:16: 720x1280
+        - Portrait 3:4: 768x1024
+        - Landscape 4:3: 1024x768
+
+        **Note:** Resolutions above ~1M pixels (e.g. 1536x1536) may cause OOM errors.
+      operationId: generateImage
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateRequest'
+            examples:
+              simple:
+                summary: Basic generation
+                value:
+                  prompt: "A fluffy orange cat sitting on a windowsill at sunset"
+                  width: 1024
+                  height: 1024
+                  num_steps: 28
+              portrait:
+                summary: Portrait photo
+                value:
+                  prompt: "Professional headshot of a woman with curly red hair, soft studio lighting, neutral gray background"
+                  width: 720
+                  height: 1280
+                  num_steps: 28
+                  guidance: 3.5
+                  seed: 12345
+              img2img:
+                summary: Image-to-image
+                value:
+                  prompt: "Same scene but in watercolor painting style"
+                  width: 1024
+                  height: 1024
+                  num_steps: 28
+                  strength: 0.7
+                  init_image: "data:image/jpeg;base64,/9j/4AAQ..."
+      responses:
+        '200':
+          description: Generated image
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Unauthorized - missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Server error (e.g. CUDA OOM)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /lora:
+    post:
+      summary: Load or unload a LoRA
+      description: |
+        Loads or unloads a LoRA checkpoint into the flow transformer.
+        LoRAs are fused directly into model weights (no additional VRAM cost).
+        The LoRA file must already exist on the pod filesystem.
+
+        **Loading:** Provide path, scale, and optionally name.
+        **Unloading:** Provide name (or path) and set action to "unload".
+      operationId: loraAction
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoraRequest'
+            examples:
+              load:
+                summary: Load a style LoRA
+                value:
+                  path: "/workspace/lora_styles/watercolor.safetensors"
+                  scale: 0.7
+                  name: "watercolor"
+                  action: "load"
+              unload:
+                summary: Unload a LoRA
+                value:
+                  name: "watercolor"
+                  action: "unload"
+      responses:
+        '200':
+          description: LoRA action completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoraResponse'
+              example:
+                status: "success"
+        '400':
+          description: Invalid action
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoraResponse'
+              example:
+                status: "error"
+                message: "Invalid action, expected 'load' or 'unload', got foo"
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Server error (e.g. LoRA file not found)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoraResponse'
+              example:
+                status: "error"
+                message: "No such file or directory: '/workspace/lora_styles/missing.safetensors'"
