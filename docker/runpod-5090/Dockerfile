@@ -14,10 +14,16 @@ WORKDIR /app/character_inference
 RUN pip install --no-cache-dir -r requirements_docker.txt && \
     pip install --no-cache-dir para-attn
 
-# Config for RTX 5090 (32GB): FP8 everything, no offloading, no compilation
+# Config for RTX 5090 (32GB): FP8 flow, bf16 T5/VAE, no offloading
 COPY config-dev-5090.json /app/character_inference/config-dev-5090.json
 
-# Add bearer token auth middleware (patches api.py used by main.py)
+# Patched api.py with structured JSON response + temp image URLs
+COPY api.py /app/character_inference/api.py
+
+# Patched flux_pipeline.py with into_individual_bytes() support
+COPY flux_pipeline.py /app/character_inference/flux_pipeline.py
+
+# Add bearer token auth middleware (patches api.py)
 COPY auth_middleware.py /app/character_inference/auth_middleware.py
 RUN sed -i '/^app = FastAPIApp()/a\\nfrom auth_middleware import BearerAuthMiddleware\napp.add_middleware(BearerAuthMiddleware)' api.py
 
@@ -32,8 +38,8 @@ ENV HF_HUB_CACHE="/workspace/hf"
 # Reduce CUDA memory fragmentation
 ENV PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-# LoRA storage
-RUN mkdir -p /lora_styles
+# LoRA storage + temp image storage
+RUN mkdir -p /lora_styles /tmp/generated_images
 
 EXPOSE 8088
 

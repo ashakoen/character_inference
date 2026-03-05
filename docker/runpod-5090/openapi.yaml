@@ -5,7 +5,7 @@ info:
     Image generation API powered by FLUX.1-dev running on RunPod with RTX 5090.
     Uses FP8 quantized flow transformer with bf16 text encoder and VAE.
     Supports LoRA loading/unloading for style and character adapters.
-  version: 1.0.0
+  version: 2.0.0
 
 servers:
   - url: https://{pod_id}-8088.proxy.runpod.net
@@ -78,6 +78,63 @@ components:
         init_image:
           type: string
           description: Base64-encoded image or file path on the pod to use as the starting image for img2img generation.
+        num_images:
+          type: integer
+          default: 1
+          minimum: 1
+          maximum: 4
+          description: Number of images to generate in a single request.
+          example: 1
+        jpeg_quality:
+          type: integer
+          default: 99
+          minimum: 1
+          maximum: 100
+          description: JPEG compression quality for output images.
+          example: 99
+
+    GenerateResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique request identifier.
+        status:
+          type: string
+          enum: [success, error]
+        input:
+          type: object
+          description: Echo of all input parameters used for generation (excluding init_image).
+        output:
+          type: array
+          items:
+            $ref: '#/components/schemas/GenerateOutput'
+          description: List of generated images with download URLs.
+        seed:
+          type: integer
+          description: The actual seed used for generation. Use this to reproduce the exact same image.
+        metrics:
+          type: object
+          properties:
+            generation_time_seconds:
+              type: number
+              format: float
+              description: Total generation time in seconds.
+
+    GenerateOutput:
+      type: object
+      properties:
+        url:
+          type: string
+          description: Relative URL to download the generated image. Prepend the pod base URL to get the full path.
+          example: "/images/a1b2c3d4-5678-90ab-cdef-1234567890ab_0.jpg"
+        width:
+          type: integer
+          example: 1024
+        height:
+          type: integer
+          example: 1024
 
     LoraRequest:
       type: object
@@ -85,7 +142,7 @@ components:
         path:
           type: string
           description: Absolute path to the LoRA safetensors file on the pod.
-          example: "/workspace/lora_styles/my-style.safetensors"
+          example: "/workspace/loras/my-style-lora.safetensors"
         scale:
           type: number
           format: float
@@ -129,7 +186,11 @@ paths:
       summary: Generate an image
       description: |
         Generates an image from a text prompt using FLUX.1-dev.
-        Returns the image as streaming JPEG bytes.
+
+        **Default (format=json):** Returns JSON with generation parameters, seed, timing metrics,
+        and temporary download URL(s) for the generated image(s). Images are available for 30 minutes.
+
+        **Backward compat (format=stream):** Returns raw streaming JPEG bytes (legacy behavior).
 
         **Recommended resolutions:**
         - Square: 1024x1024
@@ -137,11 +198,18 @@ paths:
         - Portrait 9:16: 720x1280
         - Portrait 3:4: 768x1024
         - Landscape 4:3: 1024x768
-
-        **Note:** Resolutions above ~1M pixels (e.g. 1536x1536) may cause OOM errors.
       operationId: generateImage
       security:
         - bearerAuth: []
+      parameters:
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [json, stream]
+            default: json
+          description: Response format. "json" returns structured response with image URL. "stream" returns raw JPEG bytes.
       requestBody:
         required: true
         content:
@@ -157,33 +225,55 @@ paths:
                   height: 1024
                   num_steps: 28
               portrait:
-                summary: Portrait photo
+                summary: Portrait with seed
                 value:
-                  prompt: "Professional headshot of a woman with curly red hair, soft studio lighting, neutral gray background"
+                  prompt: "Professional headshot of a woman with curly red hair, soft studio lighting"
                   width: 720
                   height: 1280
                   num_steps: 28
-                  guidance: 3.5
                   seed: 12345
-              img2img:
-                summary: Image-to-image
+              batch:
+                summary: Multiple images
                 value:
-                  prompt: "Same scene but in watercolor painting style"
+                  prompt: "A cyberpunk city street at night, neon signs, rain"
                   width: 1024
                   height: 1024
                   num_steps: 28
-                  strength: 0.7
-                  init_image: "data:image/jpeg;base64,/9j/4AAQ..."
+                  num_images: 2
       responses:
         '200':
-          description: Generated image
+          description: Generation successful (format=json)
           content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateResponse'
+              example:
+                id: "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+                status: "success"
+                input:
+                  prompt: "A fluffy orange cat sitting on a windowsill at sunset"
+                  width: 1024
+                  height: 1024
+                  num_steps: 28
+                  guidance: 3.5
+                  seed: 42
+                  strength: 1.0
+                  num_images: 1
+                  jpeg_quality: 99
+                output:
+                  - url: "/images/a1b2c3d4-5678-90ab-cdef-1234567890ab_0.jpg"
+                    width: 1024
+                    height: 1024
+                seed: 42
+                metrics:
+                  generation_time_seconds: 4.2
             image/jpeg:
               schema:
                 type: string
                 format: binary
+              description: Raw JPEG bytes (when format=stream)
         '401':
-          description: Unauthorized - missing or invalid bearer token
+          description: Unauthorized
           content:
             application/json:
               schema:
@@ -195,6 +285,48 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /images/{image_id}:
+    get:
+      summary: Download a generated image
+      description: |
+        Serves a temporarily stored generated image. Images are automatically
+        deleted after 30 minutes. The URL is returned in the POST /generate response.
+      operationId: getImage
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: image_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Image identifier (UUID_index.jpg format)
+          example: "a1b2c3d4-5678-90ab-cdef-1234567890ab_0.jpg"
+      responses:
+        '200':
+          description: Image file
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Image not found or expired
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Image not found or expired"
+
   /lora:
     post:
       summary: Load or unload a LoRA
@@ -202,9 +334,6 @@ paths:
         Loads or unloads a LoRA checkpoint into the flow transformer.
         LoRAs are fused directly into model weights (no additional VRAM cost).
         The LoRA file must already exist on the pod filesystem.
-
-        **Loading:** Provide path, scale, and optionally name.
-        **Unloading:** Provide name (or path) and set action to "unload".
       operationId: loraAction
       security:
         - bearerAuth: []
@@ -218,7 +347,7 @@ paths:
               load:
                 summary: Load a style LoRA
                 value:
-                  path: "/workspace/lora_styles/watercolor.safetensors"
+                  path: "/workspace/loras/watercolor.safetensors"
                   scale: 0.7
                   name: "watercolor"
                   action: "load"
@@ -234,17 +363,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LoraResponse'
-              example:
-                status: "success"
         '400':
           description: Invalid action
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/LoraResponse'
-              example:
-                status: "error"
-                message: "Invalid action, expected 'load' or 'unload', got foo"
         '401':
           description: Unauthorized
           content:
@@ -252,11 +376,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '500':
-          description: Server error (e.g. LoRA file not found)
+          description: Server error
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/LoraResponse'
-              example:
-                status: "error"
-                message: "No such file or directory: '/workspace/lora_styles/missing.safetensors'"
