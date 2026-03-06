@@ -558,6 +558,7 @@ class FluxPipeline:
         return_seed: bool = False,
         return_individual: bool = False,
         jpeg_quality: int = 99,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> io.BytesIO:
         """
         Generate images based on the given prompt and parameters.
@@ -646,9 +647,10 @@ class FluxPipeline:
             self.model.to(self.device_flux)
 
         # perform the denoising loop
-        for t_curr, t_prev in tqdm(
-            zip(timesteps[:-1], timesteps[1:]), total=len(timesteps) - 1, disable=silent
-        ):
+        total_steps = len(timesteps) - 1
+        for step_idx, (t_curr, t_prev) in enumerate(tqdm(
+            zip(timesteps[:-1], timesteps[1:]), total=total_steps, disable=silent
+        )):
             if t_vec is None:
                 t_vec = torch.full(
                     (img.shape[0],),
@@ -670,6 +672,9 @@ class FluxPipeline:
             )
 
             img = img + (t_prev - t_curr) * pred
+
+            if progress_callback is not None:
+                progress_callback(step_idx + 1, total_steps)
 
         # offload the model to cpu if needed
         if self.offload_flow:

@@ -1,7 +1,10 @@
 import os
+import json
 import uuid
 import time
 import asyncio
+import threading
+import queue
 from typing import Literal, Optional, TYPE_CHECKING
 
 import numpy as np
@@ -80,43 +83,74 @@ async def start_cleanup_task():
     asyncio.create_task(_periodic_cleanup())
 
 
+def _save_images(request_id, args, result, seed, is_multi):
+    """Save generated image(s) to temp dir and return output list."""
+    outputs = []
+    if is_multi:
+        for idx, img_bytes in enumerate(result):
+            image_id = f"{request_id}_{idx}"
+            filepath = os.path.join(TEMP_IMAGE_DIR, f"{image_id}.jpg")
+            with open(filepath, "wb") as f:
+                f.write(img_bytes.getvalue())
+            outputs.append({
+                "url": f"/images/{image_id}.jpg",
+                "width": args.width,
+                "height": args.height,
+            })
+    else:
+        image_id = f"{request_id}_0"
+        filepath = os.path.join(TEMP_IMAGE_DIR, f"{image_id}.jpg")
+        with open(filepath, "wb") as f:
+            f.write(result.getvalue())
+        outputs.append({
+            "url": f"/images/{image_id}.jpg",
+            "width": args.width,
+            "height": args.height,
+        })
+    return outputs
+
+
 @app.post("/generate")
 def generate(args: GenerateArgs, format: str = Query(default="json")):
     """
     Generates an image from the Flux flow transformer.
 
-    When format=json (default), returns JSON with generation parameters and
-    temporary image download URL(s). When format=stream, returns raw JPEG bytes
-    for backward compatibility.
+    Formats:
+    - json (default): Returns JSON with generation params and temp image URL(s)
+    - stream: Returns raw JPEG bytes (legacy)
+    - sse: Streams Server-Sent Events with per-step progress, then final JSON result
     """
     pipeline_args = args.model_dump(exclude={"num_images", "jpeg_quality"})
 
+    # Legacy: raw JPEG stream
     if format == "stream":
         result = app.state.model.generate(**pipeline_args)
         return StreamingResponse(result, media_type="image/jpeg")
 
+    # SSE: stream progress events then final result
+    if format == "sse":
+        return StreamingResponse(
+            _sse_generate(args, pipeline_args),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Default: blocking JSON response
     request_id = str(uuid.uuid4())
     start_time = time.time()
 
     try:
-        if args.num_images > 1:
-            images_list, seed = app.state.model.generate(
+        is_multi = args.num_images > 1
+        if is_multi:
+            result, seed = app.state.model.generate(
                 **pipeline_args,
                 num_images=args.num_images,
                 jpeg_quality=args.jpeg_quality,
                 return_individual=True,
             )
-            outputs = []
-            for idx, img_bytes in enumerate(images_list):
-                image_id = f"{request_id}_{idx}"
-                filepath = os.path.join(TEMP_IMAGE_DIR, f"{image_id}.jpg")
-                with open(filepath, "wb") as f:
-                    f.write(img_bytes.getvalue())
-                outputs.append({
-                    "url": f"/images/{image_id}.jpg",
-                    "width": args.width,
-                    "height": args.height,
-                })
         else:
             result, seed = app.state.model.generate(
                 **pipeline_args,
@@ -124,15 +158,7 @@ def generate(args: GenerateArgs, format: str = Query(default="json")):
                 jpeg_quality=args.jpeg_quality,
                 return_seed=True,
             )
-            image_id = f"{request_id}_0"
-            filepath = os.path.join(TEMP_IMAGE_DIR, f"{image_id}.jpg")
-            with open(filepath, "wb") as f:
-                f.write(result.getvalue())
-            outputs = [{
-                "url": f"/images/{image_id}.jpg",
-                "width": args.width,
-                "height": args.height,
-            }]
+        outputs = _save_images(request_id, args, result, seed, is_multi)
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -149,6 +175,82 @@ def generate(args: GenerateArgs, format: str = Query(default="json")):
         "seed": seed,
         "metrics": {"generation_time_seconds": round(generation_time, 3)},
     })
+
+
+def _sse_generate(args, pipeline_args):
+    """Generator that yields SSE events with progress and final result."""
+    request_id = str(uuid.uuid4())
+    progress_queue = queue.Queue()
+    result_holder = {}
+
+    def progress_callback(step, total):
+        progress_queue.put({"step": step, "total": total})
+
+    def run_generation():
+        try:
+            is_multi = args.num_images > 1
+            if is_multi:
+                result, seed = app.state.model.generate(
+                    **pipeline_args,
+                    num_images=args.num_images,
+                    jpeg_quality=args.jpeg_quality,
+                    return_individual=True,
+                    progress_callback=progress_callback,
+                )
+            else:
+                result, seed = app.state.model.generate(
+                    **pipeline_args,
+                    num_images=1,
+                    jpeg_quality=args.jpeg_quality,
+                    return_seed=True,
+                    progress_callback=progress_callback,
+                )
+            result_holder["result"] = result
+            result_holder["seed"] = seed
+            result_holder["is_multi"] = is_multi
+        except Exception as e:
+            result_holder["error"] = str(e)
+        finally:
+            progress_queue.put(None)  # signal done
+
+    start_time = time.time()
+
+    # Yield initial event
+    yield f"data: {json.dumps({'id': request_id, 'status': 'starting'})}\n\n"
+
+    # Start generation in background thread
+    thread = threading.Thread(target=run_generation)
+    thread.start()
+
+    # Stream progress events
+    while True:
+        try:
+            event = progress_queue.get(timeout=30)
+        except queue.Empty:
+            # Send keepalive
+            yield ": keepalive\n\n"
+            continue
+
+        if event is None:
+            break
+
+        yield f"data: {json.dumps({'id': request_id, 'status': 'generating', 'step': event['step'], 'total_steps': event['total']})}\n\n"
+
+    thread.join()
+
+    generation_time = time.time() - start_time
+
+    # Final event
+    if "error" in result_holder:
+        yield f"data: {json.dumps({'id': request_id, 'status': 'error', 'message': result_holder['error']})}\n\n"
+    else:
+        outputs = _save_images(
+            request_id, args,
+            result_holder["result"],
+            result_holder["seed"],
+            result_holder["is_multi"],
+        )
+        yield f"data: {json.dumps({'id': request_id, 'status': 'complete', 'input': args.model_dump(exclude={'init_image'}), 'output': outputs, 'seed': result_holder['seed'], 'metrics': {'generation_time_seconds': round(generation_time, 3)}})}\n\n"
 
 
 @app.get("/images/{image_id}")
