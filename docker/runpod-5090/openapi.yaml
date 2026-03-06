@@ -187,10 +187,14 @@ paths:
       description: |
         Generates an image from a text prompt using FLUX.1-dev.
 
-        **Default (format=json):** Returns JSON with generation parameters, seed, timing metrics,
-        and temporary download URL(s) for the generated image(s). Images are available for 30 minutes.
+        **format=json (default):** Blocks until done. Returns JSON with generation params, seed,
+        timing metrics, and temporary download URL(s). Images available for 30 minutes.
 
-        **Backward compat (format=stream):** Returns raw streaming JPEG bytes (legacy behavior).
+        **format=sse:** Streams Server-Sent Events with real-time per-step progress, then the
+        final JSON result. Use this for UIs that show a progress bar during generation.
+        Events: `starting` → `generating` (per step with step/total_steps) → `complete` or `error`.
+
+        **format=stream:** Returns raw JPEG bytes (legacy).
 
         **Recommended resolutions:**
         - Square: 1024x1024
@@ -207,9 +211,13 @@ paths:
           required: false
           schema:
             type: string
-            enum: [json, stream]
+            enum: [json, sse, stream]
             default: json
-          description: Response format. "json" returns structured response with image URL. "stream" returns raw JPEG bytes.
+          description: |
+            Response format:
+            - "json": Blocking JSON response with image URL(s)
+            - "sse": Server-Sent Events with per-step progress then final result
+            - "stream": Raw JPEG bytes (legacy)
       requestBody:
         required: true
         content:
@@ -267,6 +275,19 @@ paths:
                 seed: 42
                 metrics:
                   generation_time_seconds: 4.2
+            text/event-stream:
+              schema:
+                type: string
+              description: |
+                Server-Sent Events stream (when format=sse). Events:
+
+                **starting:** `data: {"id":"...","status":"starting"}`
+
+                **generating:** `data: {"id":"...","status":"generating","step":1,"total_steps":28}`
+
+                **complete:** `data: {"id":"...","status":"complete","input":{...},"output":[...],"seed":...,"metrics":{...}}`
+
+                **error:** `data: {"id":"...","status":"error","message":"..."}`
             image/jpeg:
               schema:
                 type: string
